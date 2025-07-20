@@ -1,15 +1,16 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { Shield, BarChart3, Home, Users, Sparkles } from 'lucide-react';
+import { BarChart3, Home, Users, Sparkles, Shield } from 'lucide-react';
+import PostPortalLogo from '../../PostPortal.png';
 
 const Header = () => {
   const location = useLocation();
 
   const navItems = [
     { path: '/', label: 'Home', icon: Home },
-    { path: '/users', label: 'Users', icon: Users },
-    { path: '/profile', label: 'Profile', icon: Shield },
-    { path: '/analysis', label: 'Analysis', icon: BarChart3 },
+    { path: '/users', label: 'Community', icon: Users },
+    { path: '/profile', label: 'View Profile', icon: Shield },
+    { path: '/analysis', label: 'Insights Hub', icon: BarChart3 },
   ];
 
   return (
@@ -18,12 +19,16 @@ const Header = () => {
         <div className="flex items-center justify-between h-20">
           <Link to="/" className="flex items-center space-x-3 group">
             <div className="relative">
-              <Shield className="h-10 w-10 text-slate-600 group-hover:scale-110 transition-transform duration-300" />
+              <img 
+                src={PostPortalLogo} 
+                alt="PostPortal Logo" 
+                className="h-12 w-12 group-hover:scale-110 transition-transform duration-300"
+              />
               <Sparkles className="h-4 w-4 text-amber-400 absolute -top-1 -right-1 animate-pulse" />
             </div>
             <div className="flex flex-col">
               <span className="text-2xl font-bold gradient-text">PostPatrol</span>
-              <span className="text-sm text-slate-500 font-medium">Sentiment Analyzer</span>
+              <span className="text-sm text-slate-500 font-medium">Watch. Detect. Protect.</span>
             </div>
           </Link>
           

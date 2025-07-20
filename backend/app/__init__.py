@@ -20,6 +20,11 @@ def create_app(config_name='default'):
     # Setup logging
     logging.basicConfig(level=logging.INFO)
     
+    # Import models to ensure they're registered with SQLAlchemy
+    from app.models.user import User
+    from app.models.tweet import Tweet
+    from app.models.post import Post
+    
     # Register blueprints
     from app.routes.user_routes import user_bp
     from app.routes.health_routes import health_bp

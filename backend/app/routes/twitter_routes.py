@@ -2,10 +2,12 @@
 from flask import Blueprint, request, jsonify
 from app.services.x_data_fetcher import XDataFetcher
 from app.services.x_scraper import XScraper
+from app.services.gemini_ai_service import GeminiAIService
 from app.utils.models import load_models, analyze_text, analyze_image
 from app.utils.bias_detection import detect_bias, calculate_fairness_metrics
 from app.utils.social_impact import calculate_social_impact, get_protected_groups
 from app.utils.community_outreach import get_community_metrics
+from app.models.analysis_cache import AnalysisCache
 import logging
 
 twitter_routes = Blueprint('twitter_routes', __name__)
@@ -14,6 +16,16 @@ twitter_routes = Blueprint('twitter_routes', __name__)
 models = load_models()
 x_fetcher = XDataFetcher()
 x_scraper = XScraper()
+analysis_cache = AnalysisCache()
+
+# Initialize Gemini AI service
+try:
+    gemini_service = GeminiAIService()
+    gemini_available = True
+    logging.info("Gemini AI service initialized successfully")
+except Exception as e:
+    gemini_available = False
+    logging.warning(f"Gemini AI service not available: {e}")
 
 @twitter_routes.route('/analyze', methods=['POST'])
 def analyze_user():
@@ -45,14 +57,47 @@ def analyze_user():
         if user_data.get('profile_image_url'):
             image_analysis = analyze_image(user_data['profile_image_url'], image_model, models)
         
-        # Perform bias detection
-        bias_results = detect_bias(text_analysis, user_data)
-        
-        # Calculate social impact
-        social_impact = calculate_social_impact(text_analysis, user_data)
-        
-        # Get community metrics
-        community_metrics = get_community_metrics()
+        # Use Gemini AI for dynamic analysis if available
+        if gemini_available and tweets:
+            try:
+                # Get image paths for analysis
+                image_paths = []
+                for tweet in tweets:
+                    if tweet.get('local_media_paths'):
+                        if isinstance(tweet['local_media_paths'], list):
+                            image_paths.extend(tweet['local_media_paths'])
+                        else:
+                            try:
+                                import json
+                                paths = json.loads(tweet['local_media_paths'])
+                                if isinstance(paths, list):
+                                    image_paths.extend(paths)
+                            except:
+                                pass
+                
+                # Perform dynamic analysis with Gemini
+                bias_results = gemini_service.analyze_bias_detection(tweets, user_data)
+                social_impact = gemini_service.analyze_social_impact(tweets, user_data)
+                community_metrics = gemini_service.analyze_community_outreach(tweets, user_data)
+                
+                # Add image bias analysis if images are available
+                if image_paths:
+                    image_bias = gemini_service.analyze_images_for_bias(image_paths)
+                    bias_results.update(image_bias)
+                
+                logging.info("Dynamic analysis completed using Gemini AI")
+                
+            except Exception as e:
+                logging.error(f"Gemini analysis failed, falling back to static data: {e}")
+                # Fallback to static analysis
+                bias_results = detect_bias(text_analysis, user_data)
+                social_impact = calculate_social_impact(text_analysis, user_data)
+                community_metrics = get_community_metrics()
+        else:
+            # Use static analysis
+            bias_results = detect_bias(text_analysis, user_data)
+            social_impact = calculate_social_impact(text_analysis, user_data)
+            community_metrics = get_community_metrics()
         
         # Combine results
         analysis_result = {
@@ -64,6 +109,7 @@ def analyze_user():
             'bias_detection': bias_results,
             'social_impact': social_impact,
             'community_metrics': community_metrics,
+            'analysis_type': 'dynamic' if gemini_available else 'static',
             'success': True
         }
 
@@ -75,9 +121,69 @@ def analyze_user():
 
 @twitter_routes.route('/bias-detection', methods=['GET'])
 def get_bias_detection():
-    """Get bias detection metrics"""
+    """Get bias detection metrics - now supports caching and dynamic analysis"""
     try:
-        # This would typically get data from a database or cache
+        username = request.args.get('username')
+        force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+        
+        if not username:
+            return jsonify({'error': 'Username is required'}), 400
+        
+        # Check cache first (unless force refresh)
+        if not force_refresh:
+            cached_data = analysis_cache.get_cached_analysis(username, 'bias_detection')
+            if cached_data and analysis_cache.is_cache_fresh(cached_data):
+                logging.info(f"Returning cached bias detection for {username}")
+                return jsonify({
+                    'bias_metrics': cached_data['analysis_results'].get('bias_metrics', {}),
+                    'fairness_metrics': cached_data['analysis_results'].get('fairness_metrics', {}),
+                    'analysis_type': 'dynamic' if cached_data['is_dynamic'] else 'static',
+                    'cached': True,
+                    'success': True
+                })
+        
+        # Perform fresh analysis
+        if username and gemini_available:
+            try:
+                # Fetch user data and tweets
+                user_data = x_fetcher.fetch_user_data(username)
+                tweets = x_scraper.scrape_user_tweets(username)
+                
+                if user_data and tweets:
+                    bias_results = gemini_service.analyze_bias_detection(tweets, user_data)
+                    
+                    # Extract fairness metrics from bias results
+                    bias_scores = [bias.get('score', 0) for bias in bias_results.values() if isinstance(bias, dict) and 'score' in bias]
+                    overall_fairness = 1 - (sum(bias_scores) / len(bias_scores)) if bias_scores else 0.9
+                    
+                    fairness_metrics = {
+                        'equalized_odds': overall_fairness,
+                        'demographic_parity': overall_fairness,
+                        'predictive_rate_parity': overall_fairness,
+                        'overall_fairness': overall_fairness
+                    }
+                    
+                    # Cache the results
+                    analysis_cache.cache_analysis(
+                        username, 'bias_detection', 
+                        user_data, tweets, 
+                        {'bias_metrics': bias_results, 'fairness_metrics': fairness_metrics},
+                        is_dynamic=True
+                    )
+                    
+                    return jsonify({
+                        'bias_metrics': bias_results,
+                        'fairness_metrics': fairness_metrics,
+                        'analysis_type': 'dynamic',
+                        'cached': False,
+                        'success': True
+                    })
+                    
+            except Exception as e:
+                logging.error(f"Dynamic bias analysis failed for {username}: {e}")
+                # Fall through to static data
+        
+        # Return static data as fallback
         bias_metrics = {
             'gender_bias': {
                 'score': 0.15,
@@ -111,6 +217,8 @@ def get_bias_detection():
         return jsonify({
             'bias_metrics': bias_metrics,
             'fairness_metrics': fairness_metrics,
+            'analysis_type': 'static',
+            'cached': False,
             'success': True
         })
 
@@ -120,8 +228,62 @@ def get_bias_detection():
 
 @twitter_routes.route('/social-impact', methods=['GET'])
 def get_social_impact():
-    """Get social justice impact metrics"""
+    """Get social justice impact metrics - now supports caching and dynamic analysis"""
     try:
+        username = request.args.get('username')
+        force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+        
+        if not username:
+            return jsonify({'error': 'Username is required'}), 400
+        
+        # Check cache first (unless force refresh)
+        if not force_refresh:
+            cached_data = analysis_cache.get_cached_analysis(username, 'social_impact')
+            if cached_data and analysis_cache.is_cache_fresh(cached_data):
+                logging.info(f"Returning cached social impact for {username}")
+                return jsonify({
+                    'impact_metrics': cached_data['analysis_results'].get('impact_metrics', {}),
+                    'social_justice_score': cached_data['analysis_results'].get('social_justice_score', {}),
+                    'community_impact': cached_data['analysis_results'].get('community_impact', {}),
+                    'marginalized_groups': cached_data['analysis_results'].get('marginalized_groups', []),
+                    'analysis_type': 'dynamic' if cached_data['is_dynamic'] else 'static',
+                    'cached': True,
+                    'success': True
+                })
+        
+        # Perform fresh analysis
+        if username and gemini_available:
+            try:
+                # Fetch user data and tweets
+                user_data = x_fetcher.fetch_user_data(username)
+                tweets = x_scraper.scrape_user_tweets(username)
+                
+                if user_data and tweets:
+                    social_impact = gemini_service.analyze_social_impact(tweets, user_data)
+                    
+                    # Cache the results
+                    analysis_cache.cache_analysis(
+                        username, 'social_impact', 
+                        user_data, tweets, 
+                        social_impact,
+                        is_dynamic=True
+                    )
+                    
+                    return jsonify({
+                        'impact_metrics': social_impact.get('marginalized_groups', {}),
+                        'social_justice_score': social_impact.get('social_justice_score', {}),
+                        'community_impact': social_impact.get('community_impact', {}),
+                        'marginalized_groups': _format_marginalized_groups(social_impact),
+                        'analysis_type': 'dynamic',
+                        'cached': False,
+                        'success': True
+                    })
+                    
+            except Exception as e:
+                logging.error(f"Dynamic social impact analysis failed for {username}: {e}")
+                # Fall through to static data
+        
+        # Return static data as fallback
         impact_metrics = {
             'marginalized_groups': {
                 'total_analyzed': 1250,
@@ -155,6 +317,8 @@ def get_social_impact():
         return jsonify({
             'impact_metrics': impact_metrics,
             'marginalized_groups': marginalized_groups,
+            'analysis_type': 'static',
+            'cached': False,
             'success': True
         })
 
@@ -164,8 +328,60 @@ def get_social_impact():
 
 @twitter_routes.route('/community-outreach', methods=['GET'])
 def get_community_outreach():
-    """Get community outreach metrics"""
+    """Get community outreach metrics - now supports caching and dynamic analysis"""
     try:
+        username = request.args.get('username')
+        force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+        
+        if not username:
+            return jsonify({'error': 'Username is required'}), 400
+        
+        # Check cache first (unless force refresh)
+        if not force_refresh:
+            cached_data = analysis_cache.get_cached_analysis(username, 'community_outreach')
+            if cached_data and analysis_cache.is_cache_fresh(cached_data):
+                logging.info(f"Returning cached community outreach for {username}")
+                return jsonify({
+                    'educational_programs': cached_data['analysis_results'].get('educational_programs', []),
+                    'community_initiatives': cached_data['analysis_results'].get('community_initiatives', []),
+                    'impact_metrics': cached_data['analysis_results'].get('impact_metrics', {}),
+                    'analysis_type': 'dynamic' if cached_data['is_dynamic'] else 'static',
+                    'cached': True,
+                    'success': True
+                })
+        
+        # Perform fresh analysis
+        if username and gemini_available:
+            try:
+                # Fetch user data and tweets
+                user_data = x_fetcher.fetch_user_data(username)
+                tweets = x_scraper.scrape_user_tweets(username)
+                
+                if user_data and tweets:
+                    community_data = gemini_service.analyze_community_outreach(tweets, user_data)
+                    
+                    # Cache the results
+                    analysis_cache.cache_analysis(
+                        username, 'community_outreach', 
+                        user_data, tweets, 
+                        community_data,
+                        is_dynamic=True
+                    )
+                    
+                    return jsonify({
+                        'educational_programs': community_data.get('educational_programs', []),
+                        'community_initiatives': community_data.get('community_initiatives', []),
+                        'impact_metrics': community_data.get('impact_metrics', {}),
+                        'analysis_type': 'dynamic',
+                        'cached': False,
+                        'success': True
+                    })
+                    
+            except Exception as e:
+                logging.error(f"Dynamic community outreach analysis failed for {username}: {e}")
+                # Fall through to static data
+        
+        # Return static data as fallback
         educational_programs = [
             {
                 'name': 'AI Ethics Workshop',
@@ -245,6 +461,8 @@ def get_community_outreach():
             'educational_programs': educational_programs,
             'community_initiatives': community_initiatives,
             'impact_metrics': impact_metrics,
+            'analysis_type': 'static',
+            'cached': False,
             'success': True
         })
 
@@ -252,7 +470,57 @@ def get_community_outreach():
         logging.error(f"Error in get_community_outreach: {str(e)}")
         return jsonify({'error': 'Failed to get community outreach data'}), 500
 
+@twitter_routes.route('/clear-cache', methods=['POST'])
+def clear_cache():
+    """Clear cache for a specific user"""
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        
+        if not username:
+            return jsonify({'error': 'Username is required'}), 400
+        
+        deleted_count = analysis_cache.clear_cache_for_user(username)
+        
+        return jsonify({
+            'message': f'Cache cleared for {username} ({deleted_count} entries)',
+            'success': True
+        })
+        
+    except Exception as e:
+        logging.error(f"Error clearing cache: {str(e)}")
+        return jsonify({'error': 'Failed to clear cache'}), 500
+
+def _format_marginalized_groups(social_impact):
+    """Format marginalized groups data for frontend"""
+    group_analysis = social_impact.get('marginalized_groups', {}).get('group_analysis', {})
+    
+    formatted_groups = []
+    group_names = {
+        'women': 'Women',
+        'people_of_color': 'People of Color', 
+        'lgbtq': 'LGBTQ+',
+        'disabilities': 'People with Disabilities',
+        'religious_minorities': 'Religious Minorities',
+        'economic_disadvantaged': 'Economic Disadvantaged'
+    }
+    
+    for key, name in group_names.items():
+        group_data = group_analysis.get(key, {})
+        formatted_groups.append({
+            'name': name,
+            'count': group_data.get('count', 0),
+            'bias_score': group_data.get('bias_score', 0.1),
+            'status': group_data.get('status', 'not_detected')
+        })
+    
+    return formatted_groups
+
 @twitter_routes.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'message': 'PostPatrol API is running'})
+    return jsonify({
+        'status': 'healthy', 
+        'message': 'PostPatrol API is running',
+        'gemini_available': gemini_available
+    })
